@@ -1,0 +1,102 @@
+name: Deploy to Azure with Terraform
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  TF_WORKING_DIR: 'terraform'
+  TF_STATE_RG: 'rg-terraform-tfstate'
+  # Storage account name must be globally unique across Azure (lowercase alphanumeric, max 24 chars)
+  TF_STATE_STORAGE_ACCOUNT: 'tfstatewarunawsb01'
+  TF_STATE_CONTAINER: 'tfstate'
+  AZURE_REGION: 'eastus'
+
+jobs:
+  terraform:
+    name: Terraform CI/CD
+    runs-on: ubuntu-latest
+
+    # Set bash shell by default
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # Step 1: Check out the repository
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Step 2: Login to Azure using Service Principal credentials
+      - name: Login to Azure with Service Principal
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Step 3: Automatically create Azure Storage Account for Terraform remote state (Idempotent, Zero extra cost)
+      - name: Create Terraform backend state storage
+        run: |
+          echo "Ensuring Backend State Resource Group exists..."
+          az group create \
+            --name "${{ env.TF_STATE_RG }}" \
+            --location "${{ env.AZURE_REGION }}"
+
+          echo "Ensuring Storage Account exists..."
+          az storage account create \
+            --name "${{ env.TF_STATE_STORAGE_ACCOUNT }}" \
+            --resource-group "${{ env.TF_STATE_RG }}" \
+            --location "${{ env.AZURE_REGION }}" \
+            --sku Standard_LRS \
+            --encryption-services blob
+
+          echo "Ensuring Blob Container exists..."
+          az storage container create \
+            --name "${{ env.TF_STATE_CONTAINER }}" \
+            --account-name "${{ env.TF_STATE_STORAGE_ACCOUNT }}" \
+            --auth-mode login
+
+      # Step 4: Install Terraform CLI
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      # Step 5: Initialize Terraform with remote Azure Blob backend
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ env.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ env.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.TF_STATE_CONTAINER }}" \
+            -backend-config="key=azure-infra.tfstate"
+
+      # Step 6: Validate Terraform code formatting
+      - name: Terraform Format
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check
+
+      # Step 7: Generate Execution Plan
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -no-color -out=tfplan
+
+      # Step 8: Add Terraform Plan Output to GitHub Step Summary
+      - name: Add Terraform Plan Comment
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "### 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```terraform' >> $GITHUB_STEP_SUMMARY
+          terraform show -no-color tfplan | head -n 100 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # Step 9: Apply changes (Only executes on push to main or manual dispatch)
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
